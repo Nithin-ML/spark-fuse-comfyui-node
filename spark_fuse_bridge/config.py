@@ -33,7 +33,7 @@ DEFAULT_HOST = "https://api.prod.aapse1.sparkcloud.studio"
 # render) automatically; cached-image affinity still resolves it to a digest at
 # submit time.
 DEFAULTS = {
-    "image": "ghcr.io/vfxguru/spark-fuse-comfyui:latest",
+    "image": "ghcr.io/nithin-ml/spark-fuse-comfyui:sha-7cbbd1e89580a15cf55ad95ea17f1c0dda6ac0e3",
     "command": ["python3.13", "/runner/spark_fuse_run.py"],
     "instance_type": "g7e.2xlarge",
     "assets_share_sync_path": "/comfy-flux2-klein/models",

@@ -30,7 +30,7 @@ from .config import (
 # job_id -> {status, lines[], image, error, image_cache_hit, image_affinity, exit_code}
 _JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
-_MAX_LINES = 400
+_MAX_LINES = 20000
 _log = logging.getLogger(__name__)
 
 
@@ -53,7 +53,7 @@ def get_job_state(job_id: str) -> dict | None:
         if state is None:
             return None
         snapshot = dict(state)
-        snapshot["lines"] = list(state["lines"][-200:])
+        snapshot["lines"] = list(state["lines"][-20000:])
         return snapshot
 
 
@@ -106,8 +106,11 @@ def _build_chunk_env(settings: dict) -> dict:
 
 # Add video/audio loaders here as one-line entries, e.g. "VHS_LoadVideo": ["video"].
 INPUT_FILE_NODES: dict[str, list[str]] = {
-    "LoadImage":     ["image"],
-    "LoadImageMask": ["image"],
+    "LoadImage":            ["image"],
+    "LoadImageMask":        ["image"],
+    "VHS_LoadVideo":        ["video"],
+    "VHS_LoadVideoFFmpeg":  ["video"],
+    "LoadVideo":            ["file"],
 }
 
 
