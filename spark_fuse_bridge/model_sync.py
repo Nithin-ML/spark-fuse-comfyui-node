@@ -41,6 +41,10 @@ CLOUD_MODEL_SUBDIRS = [
     "checkpoints", "diffusion_models", "unet", "text_encoders", "clip",
     "clip_vision", "vae", "loras", "controlnet", "upscale_models",
     "embeddings", "configs",
+    # Custom-node folders: the Halo Hues runner links any extra top-level folder
+    # under MODEL_BASE_DIR into ComfyUI's models/ directory (see the fork's
+    # runner/spark_fuse_run.py), so models uploaded here are found in the cloud.
+    "detection", "sams",
 ]
 
 # class_type -> {input_field: folder_paths key}. Extend with one-line entries.
@@ -76,6 +80,21 @@ MODEL_FILE_NODES: dict[str, dict[str, str]] = {
                                 "clip_name3": "text_encoders"},
     "QuadrupleCLIPLoaderGGUF": {"clip_name1": "text_encoders", "clip_name2": "text_encoders",
                                 "clip_name3": "text_encoders", "clip_name4": "text_encoders"},
+    # --- Halo Hues additions: custom-node loaders used in team workflows ---
+    # ComfyUI-WanVideoWrapper
+    "WanVideoModelLoader":            {"model": "diffusion_models"},
+    "WanVideoVAELoader":              {"model_name": "vae"},
+    "WanVideoLoraSelect":             {"lora": "loras"},
+    "WanVideoLoraSelectMulti":        {"lora_0": "loras", "lora_1": "loras", "lora_2": "loras",
+                                       "lora_3": "loras", "lora_4": "loras"},
+    "WanVideoTextEncodeCached":       {"model_name": "text_encoders"},
+    "LoadWanVideoT5TextEncoder":      {"model_name": "text_encoders"},
+    "LoadWanVideoClipTextEncoder":    {"model_name": "clip_vision"},
+    "WanVideoUni3C_ControlnetLoader": {"model": "controlnet"},
+    # ComfyUI-WanAnimatePreprocess (models/detection)
+    "OnnxDetectionModelLoader":       {"vitpose_model": "detection", "yolo_model": "detection"},
+    # Comfyui-SecNodes (models/sams)
+    "SeCModelLoader":                 {"model_file": "sams"},
 }
 
 
@@ -232,6 +251,9 @@ def check_models(workflows: list[dict], settings: dict | None = None) -> dict:
                 result["over_limit"].append(item)
             else:
                 item["size_mismatch"] = entry is not None
+                # Halo Hues: report the cloud size too, so the panel can show
+                # both and offer to render with the existing cloud copy.
+                item["remote_size"] = remote_size
                 result["uploadable"].append(item)
     finally:
         jobs._close(client)

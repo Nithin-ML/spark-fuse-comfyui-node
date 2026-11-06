@@ -11,7 +11,7 @@ import re
 from aiohttp import web
 from server import PromptServer
 
-from . import __version__, config, jobs, model_sync, render_queue
+from . import __version__, config, jobs, model_sync, output_download, render_queue
 
 routes = PromptServer.instance.routes
 
@@ -226,3 +226,37 @@ async def get_models_uploads(request):
 async def cancel_models_upload(request):
     model_sync.cancel_upload(request.match_info["upload_id"])
     return web.json_response({"ok": True})
+
+
+# ---- Output download (Halo Hues addition) --------------------------------
+# Download every file a job wrote (videos included) into
+# ComfyUI/output/spark_fuse/<job id>/. See output_download.py.
+
+@routes.get("/spark_fuse/recent_jobs")
+async def get_recent_jobs(request):
+    try:
+        items = await _run(output_download.recent_jobs)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response({"jobs": items})
+
+
+@routes.post("/spark_fuse/download/{job_id}")
+async def post_download(request):
+    job_id = request.match_info["job_id"].strip()
+    try:
+        state = output_download.start_download(job_id)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(state)
+
+
+@routes.get("/spark_fuse/download/{job_id}")
+async def get_download(request):
+    job_id = request.match_info["job_id"].strip()
+    if not output_download.valid_job_id(job_id):
+        return web.json_response({"error": "Not a valid Spark Fuse job id."}, status=400)
+    state = output_download.get_download_state(job_id)
+    if state is None:
+        return web.json_response({"error": "no download started for this job"}, status=404)
+    return web.json_response(state)
