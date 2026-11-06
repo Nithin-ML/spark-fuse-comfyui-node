@@ -78,6 +78,25 @@ function buildPanel() {
     el("div", { style: "display:flex;gap:8px;" }, runQueueBtn, clearQueueBtn),
     cancelQueueBtn);
 
+  // Download outputs (Halo Hues addition): fetch every file a job wrote —
+  // videos included — into ComfyUI/output/spark_fuse/<job id>/.
+  const dlJobInput = el("input", { id: "sf-dl-job", type: "text", placeholder: "Job ID (last render is filled in)",
+    style: inputStyle() + "flex:1;min-width:0;" });
+  const dlRecent = el("select", { id: "sf-dl-recent", style: inputStyle() + "width:100%;margin-top:4px;",
+    onchange: (e) => { if (e.target.value) dlJobInput.value = e.target.value; } });
+  dlRecent.append(el("option", { value: "", textContent: "Recent jobs…" }));
+  const dlRefresh = el("button", { textContent: "↻", title: "Refresh recent jobs", style: smallBtn("#3a3a3a"),
+    onclick: loadRecentJobs });
+  const dlBtn = el("button", { id: "sf-dl-btn", textContent: "Download outputs", style: btnStyle("#2f7d4f") + "margin-top:6px;width:100%;",
+    onclick: startOutputDownload });
+  const dlStatus = el("div", { id: "sf-dl-status", style: "font-size:11px;margin-top:6px;opacity:0.9;word-break:break-all;" });
+  const dlList = el("div", { id: "sf-dl-list", style: "display:flex;flex-direction:column;gap:2px;font-size:11px;margin-top:4px;" });
+  const downloadSection = el("details", { style: "border-top:1px solid #333;margin-top:6px;padding-top:8px;",
+    ontoggle: (e) => { if (e.target.open && dlRecent.options.length <= 1) loadRecentJobs(); } },
+    el("summary", { textContent: "Download outputs — save a job's videos and images locally", style: "cursor:pointer;font-size:13px;font-weight:bold;color:#7fffa8;margin-bottom:4px;" }),
+    el("div", { style: "display:flex;gap:6px;" }, dlJobInput, dlRefresh),
+    dlRecent, dlBtn, dlStatus, dlList);
+
   // Model-sync consent section — hidden until a check finds models to resolve.
   const consentSection = el("div", { id: "sf-consent",
     style: "display:none;border-top:1px solid #333;margin-top:6px;padding-top:8px;" });
@@ -100,6 +119,7 @@ function buildPanel() {
     el("div", { style: "display:flex;gap:8px;margin:6px 0 10px;" }, saveBtn, renderBtn),
     status,
     queueSection,
+    downloadSection,
     consentSection,
     log, preview,
   );
@@ -425,14 +445,27 @@ function showModelConsent(uploadable, overLimit, proceed) {
   const rowStyle = "display:flex;justify-content:space-between;gap:6px;background:#181818;" +
                    "border:1px solid #333;border-radius:4px;padding:4px 6px;font-size:12px;";
 
-  box.append(el("strong", { textContent: "These models are not on ShareSync yet",
-                            style: "font-size:13px;" }));
+  const onlyMismatches = uploadable.length > 0 && overLimit.length === 0 &&
+                         uploadable.every((m) => m.size_mismatch);
+  box.append(el("strong", {
+    textContent: onlyMismatches ? "These models differ from the ShareSync copy"
+                                : "These models are not on ShareSync yet",
+    style: "font-size:13px;" }));
+  if (onlyMismatches) {
+    box.append(el("div", {
+      textContent: "The file exists on ShareSync but its size differs from your local copy. " +
+                   "Uploading replaces the cloud copy; rendering with the cloud copy leaves it as is.",
+      style: "font-size:11px;opacity:0.8;margin-top:4px;" }));
+  }
   const list = el("div", { style: "display:flex;flex-direction:column;gap:3px;margin:6px 0;" });
   for (const m of uploadable) {
     list.append(el("div", { style: rowStyle },
       el("span", { textContent: `${m.folder}/${m.name}`,
                    style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" }),
-      el("span", { textContent: fmtBytes(m.size) + (m.size_mismatch ? " (will overwrite the cloud copy)" : ""),
+      el("span", { textContent: m.size_mismatch
+                     ? `local ${fmtBytes(m.size)} ≠ cloud ${fmtBytes(m.remote_size)}`
+                     : fmtBytes(m.size),
+                   title: m.size_mismatch ? `local ${m.size} bytes, cloud ${m.remote_size} bytes` : "",
                    style: "flex:none;color:#ffd479;" })));
   }
   for (const m of overLimit) {
@@ -459,6 +492,13 @@ function showModelConsent(uploadable, overLimit, proceed) {
       style: btnStyle("#7c5cff"),
       onclick: async () => { hide(); await startModelUpload(files, proceed); },
     }));
+    if (onlyMismatches) {
+      buttons.append(el("button", {
+        textContent: "Render with the cloud copy (no upload)",
+        style: btnStyle("#2f7d4f"),
+        onclick: async () => { hide(); await proceed(); },
+      }));
+    }
     buttons.append(el("button", {
       textContent: "Upload for next time (render cancelled)",
       style: btnStyle("#3a3a3a"),
@@ -631,6 +671,8 @@ function pollJob(jobId) {
       preview.style.display = "block";
     }
     if (st.status === "succeeded" || st.status === "failed" || st.status === "cancelled") {
+      const dlInput = document.getElementById("sf-dl-job");
+      if (dlInput) dlInput.value = jobId;
       clearInterval(pollTimer);
       pollTimer = null;
       setRenderEnabled(true);
@@ -786,6 +828,85 @@ async function cancelQueue() {
   if (!queueId) return;
   setStatus("Cancelling after the current batch finishes...", "#ffd479");
   try { await api(`/queue/${queueId}/cancel`, { method: "POST" }); } catch (e) { /* best effort */ }
+}
+
+// ---- Download outputs (Halo Hues addition) ------------------------------
+
+let dlPollTimer = null;
+
+function fmtJobDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString();
+}
+
+async function loadRecentJobs() {
+  const sel = document.getElementById("sf-dl-recent");
+  sel.replaceChildren(el("option", { value: "", textContent: "Loading recent jobs…" }));
+  try {
+    const res = await api("/recent_jobs");
+    if (res.error) throw new Error(res.error);
+    sel.replaceChildren(el("option", { value: "", textContent: `Recent jobs (${res.jobs.length})…` }));
+    for (const j of res.jobs) {
+      sel.append(el("option", { value: j.id,
+        textContent: `${fmtJobDate(j.created_at)} · ${j.status} · ${j.instance_type || ""} · ${j.id.slice(0, 8)}` }));
+    }
+  } catch (e) {
+    sel.replaceChildren(el("option", { value: "", textContent: `Could not load jobs: ${e.message || e}` }));
+  }
+}
+
+function setDlStatus(text, color = "#ddd") {
+  const s = document.getElementById("sf-dl-status");
+  s.textContent = text;
+  s.style.color = color;
+}
+
+async function startOutputDownload() {
+  const jobId = document.getElementById("sf-dl-job").value.trim();
+  if (!jobId) { setDlStatus("Enter a job ID or pick one from Recent jobs.", "#ff8888"); return; }
+  document.getElementById("sf-dl-list").replaceChildren();
+  const btn = document.getElementById("sf-dl-btn");
+  btn.disabled = true;
+  setDlStatus("Downloading from ShareSync…", "#ffd479");
+  try {
+    const res = await api(`/download/${encodeURIComponent(jobId)}`, { method: "POST" });
+    if (res.error && !res.status) throw new Error(res.error);
+    pollOutputDownload(jobId);
+  } catch (e) {
+    btn.disabled = false;
+    setDlStatus(`Download failed: ${e.message || e}`, "#ff8888");
+  }
+}
+
+function pollOutputDownload(jobId) {
+  if (dlPollTimer) clearInterval(dlPollTimer);
+  const started = Date.now();
+  dlPollTimer = setInterval(async () => {
+    let st;
+    try { st = await api(`/download/${encodeURIComponent(jobId)}`); } catch { return; }
+    if (st.status === "downloading") {
+      const secs = Math.round((Date.now() - started) / 1000);
+      const what = st.progress ? ` — file ${st.progress}` : "";
+      setDlStatus(`Downloading from ShareSync… ${secs}s${what} (large videos take a while)`, "#ffd479");
+      return;
+    }
+    clearInterval(dlPollTimer);
+    dlPollTimer = null;
+    document.getElementById("sf-dl-btn").disabled = false;
+    if (st.status === "failed") { setDlStatus(`Download failed: ${st.error}`, "#ff8888"); return; }
+    const files = st.files || [];
+    if (!files.length) { setDlStatus(st.error || "No files found for this job.", "#ffd479"); return; }
+    setDlStatus(`Saved ${files.length} file(s) to ${st.folder}`, "#88ff88");
+    const list = document.getElementById("sf-dl-list");
+    for (const f of files) {
+      const url = `/view?filename=${encodeURIComponent(f.name)}&subfolder=${encodeURIComponent(f.subfolder)}&type=output`;
+      list.append(el("div", { style: "display:flex;justify-content:space-between;gap:6px;" },
+        el("a", { href: url, target: "_blank", textContent: f.name, style: "color:#7fd4ff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" }),
+        el("span", { style: "opacity:0.7;white-space:nowrap;" }, fmtBytes(f.size), " ",
+          el("a", { href: url, download: f.name, textContent: "⤓", title: "Save a copy via the browser", style: "color:#7fffa8;text-decoration:none;" }))));
+    }
+  }, 2000);
 }
 
 app.registerExtension({
