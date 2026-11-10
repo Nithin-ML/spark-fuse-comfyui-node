@@ -33,7 +33,7 @@ DEFAULT_HOST = "https://api.prod.aapse1.sparkcloud.studio"
 # render) automatically; cached-image affinity still resolves it to a digest at
 # submit time.
 DEFAULTS = {
-    "image": "ghcr.io/nithin-ml/spark-fuse-comfyui:sha-a0053051620dafd6cdab05decc938ba0623c7798",
+    "image": "ghcr.io/nithin-ml/spark-fuse-comfyui:sha-49182048bcc58e530759736c1ee4f2a1e5473cd9",
     "command": ["python3.13", "/runner/spark_fuse_run.py"],
     "instance_type": "g7e.2xlarge",
     "assets_share_sync_path": "/models",
