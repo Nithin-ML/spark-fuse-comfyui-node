@@ -11,6 +11,14 @@ let pollTimer = null;
 let queueItems = [];
 let queueRunning = false;
 let queueId = null;
+// Queue video viewer (Halo Hues addition): every finished workflow's videos,
+// in queue order. qvKey is the one on screen; qvPinned means the user picked
+// it, so a newly finished video does not replace it.
+let qvVideos = [];
+let qvKey = null;
+let qvPinned = false;
+// key -> preview URL (or "failed") for videos the browser can't decode.
+let qvPreviews = {};
 // Pre-render model sync: the active background upload (id) and its poll loop.
 // The upload itself runs server-side; these only drive the progress badge.
 let uploadPollTimer = null;
@@ -78,6 +86,25 @@ function buildPanel() {
     el("div", { style: "display:flex;gap:8px;" }, runQueueBtn, clearQueueBtn),
     cancelQueueBtn);
 
+  const qvVideo = el("video", { id: "sf-qv-video", controls: true, loop: true, playsInline: true, preload: "metadata",
+    style: "width:100%;max-height:340px;background:#000;border:1px solid #333;border-radius:4px;display:block;" });
+  const queueViewer = el("div", { id: "sf-qv", style: "display:none;border-top:1px solid #333;margin-top:6px;padding-top:8px;" },
+    el("div", { id: "sf-qv-head", style: "font-size:13px;font-weight:bold;color:#7fd4ff;margin-bottom:6px;" }),
+    el("div", { id: "sf-qv-tabs", style: "display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;" }),
+    qvVideo,
+    el("div", { id: "sf-qv-msg", style: "display:none;font-size:11px;margin-top:4px;color:#ffd479;" }),
+    el("div", { style: "display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px;" },
+      el("button", { textContent: "◀", title: "Previous video", style: smallBtn("#3a3a3a"), onclick: () => stepVideo(-1) }),
+      el("span", { id: "sf-qv-name", style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:0.85;" }),
+      el("a", { id: "sf-qv-open", target: "_blank", textContent: "Open", title: "Open in a new tab", style: "color:#7fd4ff;" }),
+      el("a", { id: "sf-qv-save", textContent: "⤓", title: "Save a copy via the browser", style: "color:#7fffa8;text-decoration:none;" }),
+      el("button", { textContent: "▶", title: "Next video", style: smallBtn("#3a3a3a"), onclick: () => stepVideo(1) })));
+
+  // A ProRes / H.265 / 10-bit file either fails to load or loads with no
+  // picture (videoWidth 0, audio only). Either way, ask for a preview.
+  qvVideo.addEventListener("error", () => onUnplayableVideo());
+  qvVideo.addEventListener("loadedmetadata", () => { if (!qvVideo.videoWidth) onUnplayableVideo(); });
+
   // Download outputs (Halo Hues addition): fetch every file a job wrote —
   // videos included — into ComfyUI/output/spark_fuse/<job id>/.
   const dlJobInput = el("input", { id: "sf-dl-job", type: "text", placeholder: "Job ID (last render is filled in)",
@@ -87,6 +114,12 @@ function buildPanel() {
   dlRecent.append(el("option", { value: "", textContent: "Recent jobs…" }));
   const dlRefresh = el("button", { textContent: "↻", title: "Refresh recent jobs", style: smallBtn("#3a3a3a"),
     onclick: loadRecentJobs });
+  // Whose jobs the picker lists: the logged-in user's (default) or the whole org.
+  const dlScope = el("select", { id: "sf-dl-scope", title: "Whose jobs to list", style: inputStyle() + "width:auto;flex:none;",
+    onchange: (e) => { try { localStorage.setItem("sparkFuse.dlScope", e.target.value); } catch { /* storage off */ } loadRecentJobs(); } },
+    el("option", { value: "mine", textContent: "My jobs" }),
+    el("option", { value: "all", textContent: "All org jobs" }));
+  try { dlScope.value = localStorage.getItem("sparkFuse.dlScope") === "all" ? "all" : "mine"; } catch { /* storage off */ }
   const dlBtn = el("button", { id: "sf-dl-btn", textContent: "Download outputs", style: btnStyle("#2f7d4f") + "margin-top:6px;width:100%;",
     onclick: startOutputDownload });
   const dlStatus = el("div", { id: "sf-dl-status", style: "font-size:11px;margin-top:6px;opacity:0.9;word-break:break-all;" });
@@ -94,8 +127,10 @@ function buildPanel() {
   const downloadSection = el("details", { style: "border-top:1px solid #333;margin-top:6px;padding-top:8px;",
     ontoggle: (e) => { if (e.target.open && dlRecent.options.length <= 1) loadRecentJobs(); } },
     el("summary", { textContent: "Download outputs — save a job's videos and images locally", style: "cursor:pointer;font-size:13px;font-weight:bold;color:#7fffa8;margin-bottom:4px;" }),
-    el("div", { style: "display:flex;gap:6px;" }, dlJobInput, dlRefresh),
-    dlRecent, dlBtn, dlStatus, dlList);
+    el("div", { style: "display:flex;gap:6px;" }, dlJobInput, dlScope, dlRefresh),
+    dlRecent,
+    el("div", { id: "sf-dl-scope-note", style: "font-size:11px;opacity:0.7;margin-top:3px;" }),
+    dlBtn, dlStatus, dlList);
 
   // Model-sync consent section — hidden until a check finds models to resolve.
   const consentSection = el("div", { id: "sf-consent",
@@ -119,6 +154,7 @@ function buildPanel() {
     el("div", { style: "display:flex;gap:8px;margin:6px 0 10px;" }, saveBtn, renderBtn),
     status,
     queueSection,
+    queueViewer,
     downloadSection,
     consentSection,
     log, preview,
@@ -704,6 +740,10 @@ function renderQueueList() {
     const row = el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:6px;background:#181818;border:1px solid #333;border-radius:4px;padding:4px 6px;" },
       el("span", { textContent: `${i + 1}. ${it.label} — ${it.batch_count} img`, style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" }),
       el("span", { style: "display:flex;align-items:center;gap:6px;flex:none;" },
+        (it.videos && it.videos.length)
+          ? el("span", { textContent: "▶", title: "Show this workflow's video",
+              style: "cursor:pointer;color:#7fd4ff;", onclick: () => showItemVideo(i) })
+          : "",
         el("span", { textContent: it.status, style: `color:${c};font-size:11px;` }),
         el("span", { textContent: "✕", title: "Remove", style: queueRunning ? "display:none;" : "cursor:pointer;opacity:0.7;", onclick: () => removeQueueItem(i) })));
     list.append(row);
@@ -777,6 +817,8 @@ async function runQueue() {
 }
 
 async function submitQueue(sku) {
+  resetQueueViewer();
+  queueItems.forEach((it) => (it.videos = []));
   setQueueRunning(true);
   setStatus(`Preparing a warm instance for ${queueItems.length} job(s)...`, "#ffd479");
   try {
@@ -807,8 +849,12 @@ function pollQueue(qid) {
     log.textContent = (st.lines || []).join("\n");
     log.scrollTop = log.scrollHeight;
     if (Array.isArray(st.items)) {
-      st.items.forEach((sit) => { if (queueItems[sit.index]) queueItems[sit.index].status = sit.status; });
+      st.items.forEach((sit) => {
+        const it = queueItems[sit.index];
+        if (it) { it.status = sit.status; it.videos = sit.videos || []; }
+      });
       renderQueueList();
+      updateQueueViewer(st.items);
     }
     const map = { preparing: "#ffd479", running: "#ffd479", succeeded: "#88ff88", failed: "#ff8888", cancelled: "#ffaa55" };
     setStatus(`Queue: ${st.status || "?"}`, map[st.status] || "#ddd");
@@ -830,6 +876,135 @@ async function cancelQueue() {
   try { await api(`/queue/${queueId}/cancel`, { method: "POST" }); } catch (e) { /* best effort */ }
 }
 
+// ---- Queue video viewer (Halo Hues addition) ----------------------------
+
+const qvUrl = (v) => `/view?filename=${encodeURIComponent(v.name)}&subfolder=${encodeURIComponent(v.subfolder)}&type=output`;
+
+function resetQueueViewer() {
+  qvVideos = [];
+  qvKey = null;
+  qvPinned = false;
+  qvPreviews = {};
+  const box = document.getElementById("sf-qv");
+  if (box) box.style.display = "none";
+  const video = document.getElementById("sf-qv-video");
+  if (video) { video.pause(); video.removeAttribute("src"); video.load(); }
+}
+
+function updateQueueViewer(items) {
+  const list = [];
+  for (const it of [...items].sort((a, b) => a.index - b.index)) {
+    const vids = it.videos || [];
+    vids.forEach((v, j) => list.push({
+      key: `${v.subfolder}/${v.name}`, item: it.index, ...v,
+      tab: vids.length > 1 ? `${it.index + 1}.${j + 1}` : `${it.index + 1}`,
+      title: `${it.index + 1}. ${it.label}${vids.length > 1 ? ` (${j + 1}/${vids.length})` : ""}`,
+    }));
+  }
+  const changed = list.length !== qvVideos.length || list.some((v, i) => v.key !== qvVideos[i].key);
+  if (!changed) return;
+  qvVideos = list;
+  document.getElementById("sf-qv").style.display = list.length ? "block" : "none";
+  if (!list.length) return;
+  // Follow the newest finished video unless the user picked one to watch.
+  const keep = qvPinned && list.some((v) => v.key === qvKey);
+  renderQueueViewerTabs();
+  selectVideo(keep ? qvKey : list[list.length - 1].key, keep);
+}
+
+function renderQueueViewerTabs() {
+  const total = queueItems.length;
+  document.getElementById("sf-qv-head").textContent =
+    `Completed videos — ${new Set(qvVideos.map((v) => v.item)).size} of ${total} workflow(s)`;
+  const tabs = document.getElementById("sf-qv-tabs");
+  tabs.replaceChildren(...qvVideos.map((v) => {
+    const b = el("button", {
+      textContent: v.tab, title: v.title,
+      style: "padding:3px 8px;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:12px;color:#eee;background:#2a2a2a;",
+      onclick: () => selectVideo(v.key, true),
+    });
+    b.dataset.key = v.key;  // dataset is read-only, so it can't go through el()'s Object.assign
+    return b;
+  }));
+}
+
+function selectVideo(key, pinned) {
+  const v = qvVideos.find((x) => x.key === key);
+  if (!v) return;
+  qvPinned = pinned;
+  const video = document.getElementById("sf-qv-video");
+  if (qvKey !== key || !video.getAttribute("src")) {
+    qvKey = key;
+    const preview = qvPreviews[key];
+    setQvMsg("");
+    video.src = typeof preview === "string" && preview !== "failed" ? preview : qvUrl(v);
+    video.play().catch(() => { /* autoplay blocked: the controls still work */ });
+  }
+  for (const b of document.getElementById("sf-qv-tabs").children) {
+    const on = b.dataset.key === key;
+    b.style.background = on ? "#7c5cff" : "#2a2a2a";
+    b.style.borderColor = on ? "#7c5cff" : "#555";
+  }
+  document.getElementById("sf-qv-name").textContent = `${v.title} — ${v.name}`;
+  document.getElementById("sf-qv-name").title = `${v.subfolder}/${v.name}`;
+  document.getElementById("sf-qv-open").href = qvUrl(v);
+  const save = document.getElementById("sf-qv-save");
+  save.href = qvUrl(v);
+  save.download = v.name;
+}
+
+function setQvMsg(text, color = "#ffd479") {
+  const m = document.getElementById("sf-qv-msg");
+  if (!m) return;
+  m.textContent = text;
+  m.style.color = color;
+  m.style.display = text ? "block" : "none";
+}
+
+async function onUnplayableVideo() {
+  const key = qvKey;
+  const v = qvVideos.find((x) => x.key === key);
+  if (!v || qvPreviews[key]) {
+    if (v && qvPreviews[key] === "failed") return;  // message already shown
+    if (v && qvPreviews[key] !== "pending") {
+      setQvMsg("The browser can't play this video even as a preview. Use Open to play it in your video player.", "#ff8888");
+    }
+    return;
+  }
+  qvPreviews[key] = "pending";
+  setQvMsg("This video's format (e.g. ProRes, H.265 or 10-bit) can't play in the browser — making a preview…");
+  try {
+    const res = await api("/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: v.name, subfolder: v.subfolder }),
+    });
+    if (res.error) throw new Error(res.error);
+    const url = `/view?filename=${encodeURIComponent(res.name)}&subfolder=${encodeURIComponent(res.subfolder)}&type=output&t=${Date.now()}`;
+    qvPreviews[key] = url;
+    if (qvKey === key) {
+      setQvMsg("Showing a browser preview (H.264). Open / ⤓ give you the original file.", "#88ff88");
+      const video = document.getElementById("sf-qv-video");
+      video.src = url;
+      video.play().catch(() => {});
+    }
+  } catch (e) {
+    qvPreviews[key] = "failed";
+    if (qvKey === key) setQvMsg(`Preview failed: ${e.message || e}. Use Open to play the original.`, "#ff8888");
+  }
+}
+
+function stepVideo(delta) {
+  if (!qvVideos.length) return;
+  const i = Math.max(0, qvVideos.findIndex((v) => v.key === qvKey));
+  selectVideo(qvVideos[(i + delta + qvVideos.length) % qvVideos.length].key, true);
+}
+
+function showItemVideo(itemIndex) {
+  const v = qvVideos.find((x) => x.item === itemIndex);
+  if (v) selectVideo(v.key, true);
+}
+
 // ---- Download outputs (Halo Hues addition) ------------------------------
 
 let dlPollTimer = null;
@@ -842,14 +1017,24 @@ function fmtJobDate(iso) {
 
 async function loadRecentJobs() {
   const sel = document.getElementById("sf-dl-recent");
+  const scope = document.getElementById("sf-dl-scope")?.value || "mine";
+  const note = document.getElementById("sf-dl-scope-note");
   sel.replaceChildren(el("option", { value: "", textContent: "Loading recent jobs…" }));
+  note.textContent = "";
   try {
-    const res = await api("/recent_jobs");
+    const res = await api(`/recent_jobs?scope=${scope}`);
     if (res.error) throw new Error(res.error);
-    sel.replaceChildren(el("option", { value: "", textContent: `Recent jobs (${res.jobs.length})…` }));
+    const mineLabel = scope === "mine" ? "My recent jobs" : "Recent org jobs";
+    sel.replaceChildren(el("option", { value: "", textContent: `${mineLabel} (${res.jobs.length})…` }));
     for (const j of res.jobs) {
+      const who = scope === "all" && j.mine ? " · mine" : "";
       sel.append(el("option", { value: j.id,
-        textContent: `${fmtJobDate(j.created_at)} · ${j.status} · ${j.instance_type || ""} · ${j.id.slice(0, 8)}` }));
+        textContent: `${fmtJobDate(j.created_at)} · ${j.status} · ${j.instance_type || ""} · ${j.id.slice(0, 8)}${who}` }));
+    }
+    if (scope === "mine") {
+      note.textContent = res.jobs.length
+        ? `Jobs of ${res.email || "this login"}${res.matched_by === "this computer" ? " rendered from this computer" : ""}.`
+        : `No jobs found for ${res.email || "this login"} yet. Jobs you render from now on will show here; switch to "All org jobs" to see older ones.`;
     }
   } catch (e) {
     sel.replaceChildren(el("option", { value: "", textContent: `Could not load jobs: ${e.message || e}` }));
