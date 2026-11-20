@@ -11,7 +11,8 @@ import re
 from aiohttp import web
 from server import PromptServer
 
-from . import __version__, config, jobs, model_sync, output_download, render_queue
+from . import (__version__, config, jobs, model_sync, output_download, render_queue,
+               video_preview)
 
 routes = PromptServer.instance.routes
 
@@ -127,6 +128,7 @@ async def post_submit(request):
         job_id = await _run(lambda: jobs.submit_workflow(prompt, instance_type))
     except Exception as exc:  # noqa: BLE001
         return web.json_response({"error": str(exc)}, status=400)
+    output_download.remember_job(job_id)  # for the "my jobs" filter
     return web.json_response({"jobId": job_id})
 
 
@@ -235,10 +237,11 @@ async def cancel_models_upload(request):
 @routes.get("/spark_fuse/recent_jobs")
 async def get_recent_jobs(request):
     try:
-        items = await _run(output_download.recent_jobs)
+        scope = request.query.get("scope", "mine")
+        result = await _run(lambda: output_download.recent_jobs(scope=scope))
     except Exception as exc:  # noqa: BLE001
         return web.json_response({"error": str(exc)}, status=400)
-    return web.json_response({"jobs": items})
+    return web.json_response(result)
 
 
 @routes.post("/spark_fuse/download/{job_id}")
@@ -260,3 +263,23 @@ async def get_download(request):
     if state is None:
         return web.json_response({"error": "no download started for this job"}, status=404)
     return web.json_response(state)
+
+
+# ---- Browser preview for the queue video viewer (Halo Hues addition) ------
+# The panel calls this when its player can't decode a video (ProRes, H.265,
+# 10-bit ...). See video_preview.py.
+
+@routes.post("/spark_fuse/preview")
+async def post_preview(request):
+    try:
+        body = await request.json()
+        name, subfolder = str(body["name"]), str(body.get("subfolder") or "")
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "Expected {name, subfolder}."}, status=400)
+    try:
+        result = await _run(lambda: video_preview.make_preview(name, subfolder))
+    except FileNotFoundError as exc:
+        return web.json_response({"error": str(exc)}, status=404)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response(result)

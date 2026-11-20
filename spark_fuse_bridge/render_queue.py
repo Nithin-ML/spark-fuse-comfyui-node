@@ -27,7 +27,7 @@ import uuid
 from spark_fuse.errors import NoWarmPoolCapacityError
 from spark_fuse.models import LogEvent
 
-from . import jobs
+from . import jobs, output_download, queue_outputs
 from .config import load_settings, make_client, queue_chunk_size
 
 _QUEUES: dict[str, dict] = {}
@@ -181,12 +181,32 @@ def submit_queue(items: list[dict], instance_type: str | None = None) -> str:
         batch = _clamp(it.get("batch_count"))
         norm_items.append({"workflow": it["workflow"], "batch_count": batch, "label": label})
         state_items.append({"index": i, "label": label, "batch_count": batch,
-                            "status": "queued", "job_id": None, "images": [], "error": None})
+                            "status": "queued", "job_id": None, "images": [], "videos": [],
+                            "error": None})
     _set(qid, status="preparing", instance_handle=None, image=None, error=None,
          cancel=False, active_job=None, items=state_items)
     threading.Thread(target=_run_queue, args=(qid, norm_items, instance_type, settings),
                      daemon=True).start()
     return qid
+
+
+def _start_live_videos(client, qid: str, job_id: str, local: int, global_idx: int) -> None:
+    """Fetch a just-finished workflow's videos in the background so the panel
+    can show them while the rest of the batch renders (Halo Hues addition)."""
+    item = _get_item(qid, global_idx)
+    if not item or item.get("_live_started"):
+        return
+    _set_item(qid, global_idx, _live_started=True)
+
+    def on_videos(videos: list[dict]) -> None:
+        _set_item(qid, global_idx, videos=videos)
+
+    def still_wanted() -> bool:
+        current = _get_item(qid, global_idx)
+        return bool(current) and not current.get("videos")
+
+    queue_outputs.fetch_live(client, qid, job_id, local, global_idx, item["label"],
+                             on_videos, lambda m: _append(qid, m), still_wanted)
 
 
 def _stream_chunk(client, job_id: str, qid: str, batch_offset: int) -> None:
@@ -219,10 +239,13 @@ def _stream_chunk(client, job_id: str, qid: str, batch_offset: int) -> None:
                     _set_item(qid, global_idx, status="running")
                 elif event_kind == "succeeded":
                     _set_item(qid, global_idx, status="succeeded", _has_output=True)
+                    _start_live_videos(client, qid, job_id, local, global_idx)
                 else:  # failed
                     reason = m.group("reason") or "workflow failed"
                     _set_item(qid, global_idx, status="failed", error=reason,
                               _has_output=m.group("count") is not None)
+                    if m.group("count") is not None:  # partial outputs were saved
+                        _start_live_videos(client, qid, job_id, local, global_idx)
             elif current_local is not None:
                 global_idx = batch_offset + current_local - 1
                 _record_item_line(qid, global_idx, line)
@@ -410,10 +433,27 @@ def _run_queue(qid: str, items: list[dict], instance_type: str | None, settings:
                 waited += 5
                 session = client.get_instance(handle)
             if not session.is_ready:
-                raise RuntimeError(
-                    f"instance prepare {session.status}: "
-                    f"{session.error_code or ''} {session.error_message or ''}".strip())
+                reason = (f"{session.error_code or ''} "
+                          f"{session.error_message or ''}").strip()
+                # Halo Hues: a capacity shortage can also surface here, after a
+                # successful prepare, when the cloud can't start the instance.
+                # With affinity 'preferred', fall back to independent submits
+                # exactly as the up-front 503 path does, instead of aborting.
+                if ("capacity" in reason.lower() and affinity != "required"):
+                    _append(qid, f"[queue] warm instance could not start ({reason[:160]}); "
+                                 "running without a warm session (cold starts apply)")
+                    try:
+                        client.release_instance(handle)
+                    except Exception:  # noqa: BLE001 - it never started
+                        pass
+                    handle = None
+                    _set(qid, instance_handle=None)
+                    session = None
+                else:
+                    raise RuntimeError(
+                        f"instance prepare {session.status}: {reason}")
 
+        if session is not None:
             _append(qid, f"[queue] instance ready; running {len(batches)} batch(es)")
         else:
             _append(qid, f"[queue] running {len(batches)} batch(es) without a warm session")
@@ -446,6 +486,7 @@ def _run_queue(qid: str, items: list[dict], instance_type: str | None, settings:
                 break
 
             job_id = resp.job_id
+            output_download.remember_job(job_id)  # for the "my jobs" filter
             for local in range(1, count + 1):
                 _set_item(qid, offset + local - 1, job_id=job_id)
             _set_active_job(qid, job_id)
@@ -508,9 +549,20 @@ def _run_queue(qid: str, items: list[dict], instance_type: str | None, settings:
                         continue
                     if item["status"] == "failed" and not item.get("_has_output"):
                         continue  # marker already told us there is nothing to download
-                    saved = jobs._download_chunk_item_images(
-                        client, job, base_url, local, log=lambda m: _append(qid, m))
+                    # One walk of wf_NN/: images for the preview (as before)
+                    # and any videos the live fetch missed or got partly.
+                    try:
+                        saved, videos = queue_outputs.collect_final(
+                            client, qid, base_url, local, global_idx, item["label"])
+                    except Exception as exc:  # noqa: BLE001
+                        _append(qid, f"[queue] workflow {global_idx + 1}: output "
+                                     f"download failed — {exc}")
+                        continue
+                    if videos:
+                        _set_item(qid, global_idx, videos=videos)
                     if saved:
+                        _append(qid, f"[bridge] saved {len(saved)} image(s) to ComfyUI "
+                                     f"output: {', '.join(saved)}")
                         _set_item(qid, global_idx, images=saved)
                         _set(qid, image=saved[0])
 

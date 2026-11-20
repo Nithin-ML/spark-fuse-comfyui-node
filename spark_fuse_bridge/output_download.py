@@ -70,15 +70,88 @@ def start_download(job_id: str) -> dict:
     return get_download_state(job_id)
 
 
-def recent_jobs(limit: int = 20) -> list[dict]:
-    """Newest jobs visible to this account (the whole org), for the panel's
-    job picker. List responses carry no output URL; that is resolved per job
-    when a download starts."""
+# ---- "My jobs" (Halo Hues addition) ---------------------------------------
+# Spark Fuse lists every job in the organisation. To show each person only
+# their own, a job counts as "mine" when either:
+#   1. its user_id matches the logged-in account. The id is read from the
+#      login token when it is a JWT; otherwise it is learned from jobs this
+#      Bridge submitted (they all carry the same user_id); or
+#   2. this Bridge submitted it while logged in with the current email
+#      (remembered in my_jobs.json next to the Bridge settings).
+
+_HISTORY_LOCK = threading.Lock()
+_HISTORY_MAX = 1000
+_UID_KEYS = ("user_id", "userId", "uid", "id", "sub")
+
+
+def _history_path() -> Path:
+    from . import config
+    return config._settings_path().parent / "my_jobs.json"
+
+
+def _current_email(client=None) -> str:
+    import os
+    email = getattr(getattr(client, "_auth", None), "_email", None) if client else None
+    email = email or load_settings().get("email") or os.environ.get("SPARK_FUSE_EMAIL", "")
+    return (email or "").strip().lower()
+
+
+def _load_history() -> dict:
+    import json
+    try:
+        return json.loads(_history_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - missing or unreadable: start fresh
+        return {}
+
+
+def remember_job(job_id: str | None) -> None:
+    """Record that the current login submitted this job. Never raises."""
+    import json
+    if not job_id:
+        return
+    try:
+        email = _current_email()
+        if not email:
+            return
+        with _HISTORY_LOCK:
+            data = _load_history()
+            ids = [i for i in data.get(email, []) if i != job_id] + [job_id]
+            data[email] = ids[-_HISTORY_MAX:]
+            path = _history_path()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _user_id_from_token(token: str | None) -> int | None:
+    """The account id inside a JWT login token, if the token is one."""
+    import base64
+    import json
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except Exception:  # noqa: BLE001 - not a JWT
+        return None
+    for key in _UID_KEYS:
+        value = claims.get(key)
+        if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+            return int(value)
+    return None
+
+
+def recent_jobs(limit: int = 30, scope: str = "mine") -> dict:
+    """Newest jobs for the panel's job picker: only the logged-in user's by
+    default, the whole org with scope="all". List responses carry no output
+    URL; that is resolved per job when a download starts."""
     settings = load_settings()
     client = make_client(settings)
     try:
         client.login()
         jobs = client.list_jobs()
+        token = client._ensure_token()
+        email = _current_email(client)
     finally:
         close = getattr(client, "close", None)
         if callable(close):
@@ -87,9 +160,30 @@ def recent_jobs(limit: int = 20) -> list[dict]:
             except Exception:  # noqa: BLE001
                 pass
     jobs.sort(key=lambda j: j.created_at or "", reverse=True)
-    return [{"id": j.id, "status": j.status, "created_at": j.created_at,
-             "instance_type": j.instance_type_name}
-            for j in jobs[:limit]]
+
+    with _HISTORY_LOCK:
+        submitted = set(_load_history().get(email, []))
+    uid = _user_id_from_token(token)
+    matched_by = "account"
+    if uid is None:
+        # Learn the account id from jobs this Bridge submitted, if they agree.
+        ids = {j.user_id for j in jobs if j.id in submitted and j.user_id is not None}
+        uid = ids.pop() if len(ids) == 1 else None
+        matched_by = "account" if uid is not None else "this computer"
+
+    def mine(j) -> bool:
+        return j.id in submitted or (uid is not None and j.user_id == uid)
+
+    if scope != "all":
+        jobs = [j for j in jobs if mine(j)]
+    return {
+        "scope": "all" if scope == "all" else "mine",
+        "email": email,
+        "matched_by": matched_by,
+        "jobs": [{"id": j.id, "status": j.status, "created_at": j.created_at,
+                  "instance_type": j.instance_type_name, "mine": mine(j)}
+                 for j in jobs[:limit]],
+    }
 
 
 def _resolve_output_url(client, job_id: str) -> str | None:
