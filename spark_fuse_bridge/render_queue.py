@@ -40,6 +40,8 @@ _MAX_LINES = 600
 _HOLD_SECONDS = 600
 _READY_TIMEOUT = 900   # max seconds to wait for the instance to report ready
 _JOB_TIMEOUT = 7200    # per-batch safety ceiling
+_STATUS_WAIT = 900     # keep retrying a failing job-status check this long
+_STREAM_RECONNECTS = 30  # live-log reconnects per batch
 _AFFINITY_RETRIES = 3  # attempts on NoWarmPoolCapacityError before fallback/abort
 _AFFINITY_RETRY_SLEEP = 5  # seconds between capacity-retry attempts
 # Grace period after a batch's job goes terminal, before gap-filling and
@@ -183,7 +185,7 @@ def submit_queue(items: list[dict], instance_type: str | None = None) -> str:
         state_items.append({"index": i, "label": label, "batch_count": batch,
                             "status": "queued", "job_id": None, "images": [], "videos": [],
                             "error": None})
-    _set(qid, status="preparing", instance_handle=None, image=None, error=None,
+    _set(qid, status="preparing", instance_handle=None, image=None, image_subfolder=None, error=None,
          cancel=False, active_job=None, items=state_items)
     threading.Thread(target=_run_queue, args=(qid, norm_items, instance_type, settings),
                      daemon=True).start()
@@ -221,36 +223,55 @@ def _stream_chunk(client, job_id: str, qid: str, batch_offset: int) -> None:
     stream open past the job's terminal state).
     """
     current_local = None
-    try:
-        for event in client.stream_logs(job_id):
-            if not _job_still_active(qid, job_id):
-                break
-            if not isinstance(event, LogEvent):
-                continue
-            line = event.line
-            _append(qid, f"  {line}")
-            m = _MARKER_RE.match(line)
-            if m:
-                local = int(m.group("local"))
-                global_idx = batch_offset + local - 1
-                current_local = local
-                event_kind = m.group("event")
-                if event_kind == "started":
-                    _set_item(qid, global_idx, status="running")
-                elif event_kind == "succeeded":
-                    _set_item(qid, global_idx, status="succeeded", _has_output=True)
-                    _start_live_videos(client, qid, job_id, local, global_idx)
-                else:  # failed
-                    reason = m.group("reason") or "workflow failed"
-                    _set_item(qid, global_idx, status="failed", error=reason,
-                              _has_output=m.group("count") is not None)
-                    if m.group("count") is not None:  # partial outputs were saved
-                        _start_live_videos(client, qid, job_id, local, global_idx)
-            elif current_local is not None:
-                global_idx = batch_offset + current_local - 1
-                _record_item_line(qid, global_idx, line)
-    except Exception:  # noqa: BLE001 - the log feed is non-essential
-        pass
+    # Halo Hues: the log feed has no replay, so a dropped connection (PC
+    # network blip, gateway timeout) used to end the live log for the rest of
+    # the batch. Reconnect instead; lines sent while disconnected are lost,
+    # but the batch result and downloads don't depend on them.
+    reconnects = 0
+    while True:
+        try:
+            for event in client.stream_logs(job_id):
+                if not _job_still_active(qid, job_id):
+                    return
+                current_local = _handle_log_event(client, event, job_id, qid,
+                                                  batch_offset, current_local)
+            return  # server closed the stream: the job is finished
+        except Exception as exc:  # noqa: BLE001 - the log feed is non-essential
+            reconnects += 1
+            if not _job_still_active(qid, job_id) or reconnects > _STREAM_RECONNECTS:
+                return
+            _append(qid, f"[queue] live log connection dropped ({exc}); reconnecting "
+                         f"({reconnects}/{_STREAM_RECONNECTS}) — some lines may be missing")
+            time.sleep(min(5 * reconnects, 30))
+
+
+def _handle_log_event(client, event, job_id: str, qid: str, batch_offset: int,
+                      current_local):
+    if not isinstance(event, LogEvent):
+        return current_local
+    line = event.line
+    _append(qid, f"  {line}")
+    m = _MARKER_RE.match(line)
+    if m:
+        local = int(m.group("local"))
+        global_idx = batch_offset + local - 1
+        current_local = local
+        event_kind = m.group("event")
+        if event_kind == "started":
+            _set_item(qid, global_idx, status="running")
+        elif event_kind == "succeeded":
+            _set_item(qid, global_idx, status="succeeded", _has_output=True)
+            _start_live_videos(client, qid, job_id, local, global_idx)
+        else:  # failed
+            reason = m.group("reason") or "workflow failed"
+            _set_item(qid, global_idx, status="failed", error=reason,
+                      _has_output=m.group("count") is not None)
+            if m.group("count") is not None:  # partial outputs were saved
+                _start_live_videos(client, qid, job_id, local, global_idx)
+    elif current_local is not None:
+        global_idx = batch_offset + current_local - 1
+        _record_item_line(qid, global_idx, line)
+    return current_local
 
 
 def _wait_job_to_terminal(client, job_id: str, qid: str, label: str):
@@ -268,7 +289,7 @@ def _wait_job_to_terminal(client, job_id: str, qid: str, label: str):
     branch in _run_queue, which skips the normal completion path entirely
     rather than reading exit_code/output off a job that may still be running.
     """
-    job = client.get_job(job_id)
+    job = _get_job_patiently(client, job_id, qid, label)
     waited = last_beat = 0
     while not job.is_terminal:
         if waited >= _JOB_TIMEOUT:
@@ -278,8 +299,34 @@ def _wait_job_to_terminal(client, job_id: str, qid: str, label: str):
         if waited - last_beat >= 30:
             _append(qid, f"[queue] {label}: running ({waited}s)")
             last_beat = waited
-        job = client.get_job(job_id)
+        job = _get_job_patiently(client, job_id, qid, label)
     return job, False
+
+
+def _get_job_patiently(client, job_id: str, qid: str, label: str):
+    """client.get_job, but a status check that fails (read timeout, dropped
+    connection, gateway error) is retried for up to _STATUS_WAIT seconds
+    instead of ending the queue. One timed-out status check used to stop the
+    whole queue while the job kept rendering on Spark Fuse."""
+    start = time.monotonic()
+    attempt = 0
+    while True:
+        try:
+            job = client.get_job(job_id)
+            if attempt:
+                _append(qid, f"[queue] {label}: status check working again")
+            return job
+        except Exception as exc:  # noqa: BLE001
+            attempt += 1
+            elapsed = time.monotonic() - start
+            if elapsed >= _STATUS_WAIT:
+                raise RuntimeError(
+                    f"could not reach Spark Fuse for {int(elapsed)}s to check job "
+                    f"{job_id} ({exc}). The job may still be running: check it in "
+                    "Download outputs -> My jobs.") from exc
+            _append(qid, f"[queue] {label}: status check failed ({exc}); "
+                         f"retrying (waited {int(elapsed)}s of {_STATUS_WAIT}s)")
+            time.sleep(min(5 * attempt, 30))
 
 
 def _fill_marker_gaps(qid: str, batch_offset: int, count: int, reason: str) -> None:
@@ -357,7 +404,7 @@ def _release_instance(client, qid: str, handle: str, stuck_job_id: str | None) -
         while not job.is_terminal and waited < _CANCEL_GRACE_SECONDS:
             time.sleep(3)
             waited += 3
-            job = client.get_job(stuck_job_id)
+            job = _get_job_patiently(client, stuck_job_id, qid, "cancel")
 
         if not job.is_terminal:
             _append(qid, f"[queue] job {stuck_job_id} still not terminal "
@@ -560,11 +607,14 @@ def _run_queue(qid: str, items: list[dict], instance_type: str | None, settings:
                         continue
                     if videos:
                         _set_item(qid, global_idx, videos=videos)
+                    if saved or videos:
+                        folder = (saved or videos)[0]["subfolder"].split("/")[:3]
+                        _append(qid, f"[bridge] workflow {global_idx + 1}: saved "
+                                     f"{len(videos)} video(s) and {len(saved)} image(s) to "
+                                     f"ComfyUI/output/{'/'.join(folder)}/")
                     if saved:
-                        _append(qid, f"[bridge] saved {len(saved)} image(s) to ComfyUI "
-                                     f"output: {', '.join(saved)}")
-                        _set_item(qid, global_idx, images=saved)
-                        _set(qid, image=saved[0])
+                        _set_item(qid, global_idx, images=[i["name"] for i in saved])
+                        _set(qid, image=saved[0]["name"], image_subfolder=saved[0]["subfolder"])
 
             _append(qid, f"[queue] batch {batch_index + 1}/{len(batches)}: done")
             offset += count
@@ -579,6 +629,19 @@ def _run_queue(qid: str, items: list[dict], instance_type: str | None, settings:
                     else f"[queue] finished with {fails} failed workflow(s)")
     except Exception as exc:  # noqa: BLE001 - any failure should surface in the UI
         _append(qid, f"[queue error] {exc}")
+        # Halo Hues: don't leave items stuck at running/queued. The job may
+        # still finish on Spark Fuse, so say where to get its outputs.
+        with _LOCK:
+            pending = [i for i, it in enumerate(_QUEUES[qid]["items"])
+                       if it.get("status") in ("queued", "running")]
+        for i in pending:
+            _set_item(qid, i, status="failed",
+                      error="the panel lost contact with Spark Fuse; the job may "
+                            "still finish. Check Download outputs -> My jobs.")
+        if pending:
+            _append(qid, "[queue] the panel stopped following this queue. A job that "
+                         "was already running may still finish on Spark Fuse: download "
+                         "it from Download outputs -> My jobs.")
         _set(qid, status="failed", error=str(exc))
         traceback.print_exc()
     finally:
